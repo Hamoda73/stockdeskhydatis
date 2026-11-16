@@ -1,0 +1,41 @@
+﻿# DEVELOPMENT ONLY: local stack for StockDesk. Do not use on a shared or public server.
+#
+#   cp .env.example .env     # then edit the example values (.env is git-ignored)
+#   docker compose up --build
+#
+# Everything is bound to 127.0.0.1, so the stack is not reachable from the network.
+services:
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:3000:3000"      # loopback only, and no 9229 (debugger)
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  db:
+    # TODO verify: 16 is a currently supported PostgreSQL major version, and pin a digest.
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-stockdesk}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in your local .env}
+      POSTGRES_DB: stockdesk
+    # No "ports:" on purpose: only the app reaches the database, on the compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-stockdesk} -d stockdesk"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+
+volumes:
+  dbdata:

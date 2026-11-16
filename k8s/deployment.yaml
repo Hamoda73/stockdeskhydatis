@@ -1,0 +1,105 @@
+﻿# The secret "stockdesk-env" is not in this repository: an administrator creates it in the
+# cluster (see RISKS.md and k8s/examples/secret.example.yaml).
+# The pipeline replaces __IMAGE_TAG__ with the commit SHA.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stockdesk
+  namespace: stockdesk
+  labels:
+    app: stockdesk
+spec:
+  # Keep 1: stock data is held in memory (src/server.js), so a second replica would hold
+  # different numbers. Raise it only when the data lives in PostgreSQL.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: stockdesk
+  template:
+    metadata:
+      labels:
+        app: stockdesk
+    spec:
+      automountServiceAccountToken: false   # the app does not call the Kubernetes API
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001                    # same id as the user in the Dockerfile
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stockdesk
+          image: registry.corvane.example/stockdesk:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent     # fine: every commit has its own tag
+          ports:
+            - name: http
+              containerPort: 3000           # the debug port 9229 is gone
+          env:
+            - name: PORT
+              value: "3000"
+          envFrom:
+            - secretRef:
+                name: stockdesk-env         # DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, API_KEY
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Estimates, not measured: adjust after watching real usage.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp               # the only writable path (startup marker file)
+          # Liveness does not touch the database, so a DB outage cannot restart-loop the pod.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness includes the database check: traffic stops, the pod is not restarted.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stockdesk
+  namespace: stockdesk
+  labels:
+    app: stockdesk
+spec:
+  # ClusterIP instead of LoadBalancer: nothing is exposed to the internet.
+  # Before suppliers connect, expose it through an Ingress with TLS (not done, see RISKS.md).
+  # Until then: kubectl -n stockdesk port-forward svc/stockdesk 8080:80
+  type: ClusterIP
+  selector:
+    app: stockdesk
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

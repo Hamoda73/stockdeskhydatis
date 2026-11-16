@@ -1,0 +1,31 @@
+# Automatic update PRs for the things pinned in this repository.
+# These are VERSION updates. Security alerts / security updates are repository settings
+# (Settings > Code security), not configured here: see RISKS.md.
+# Every update PR must be reviewed by a human. Do not enable auto-merge: a SHA-pinned action
+# bump is a code change in the pipeline that holds the deploy credentials.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    ignore:
+      # Changing the Node major line (and so the LTS choice) is a deliberate manual decision.
+      # TODO verify: dependency name against the FROM line of the Dockerfile.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+
+  # There is no npm dependency today. When one is added, add an "npm" block here.
+  #
+  # TODO verify (not enabled because I could not check them here):
+  #   * a "docker-compose" ecosystem for docker-compose.yml, if it exists in your Dependabot version;
+  #   * a "cooldown" option, to delay brand-new releases by a few days.

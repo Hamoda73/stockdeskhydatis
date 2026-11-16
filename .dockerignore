@@ -1,0 +1,15 @@
+# Keep secrets, history and non-runtime files out of the build context and the image.
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.*
+node_modules
+npm-debug.log*
+*.log
+k8s
+test
+docker-compose*.yml
+Dockerfile
+*.md

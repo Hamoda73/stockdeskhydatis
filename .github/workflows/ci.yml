@@ -1,0 +1,168 @@
+﻿# StockDesk CI/CD. Written to be plausible and consistent, it has NOT been run.
+# "TODO verify" marks what I could not look up (action SHAs, input names, tool versions).
+# Reasoning for each choice is in RISKS.md.
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:            # not pull_request_target: PRs from forks get no secrets and a read-only token
+    branches: [main]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash            # explicit bash also turns on pipefail
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: registry.corvane.example
+  # One immutable tag per commit, never "latest": we know what runs and can roll back.
+  IMAGE_REF: registry.corvane.example/stockdesk:${{ github.sha }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@<FULL_COMMIT_SHA_TODO_VERIFY>   # v4, TODO verify the SHA matches this tag
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@<FULL_COMMIT_SHA_TODO_VERIFY> # v4, TODO verify the SHA matches this tag
+        with:
+          # Same major as the Dockerfile (node:24-alpine). package.json only requires >=18.
+          # TODO verify that 24 is the LTS line you want (nodejs.org/en/about/previous-releases).
+          node-version: "24"
+
+      # No dependencies (package.json), so no install step. If one is added: commit a lockfile
+      # and use `npm ci --ignore-scripts`, never `npm install`.
+      - name: Run tests
+        run: npm test
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@<FULL_COMMIT_SHA_TODO_VERIFY>   # v4, TODO verify
+        with:
+          fetch-depth: 0             # whole history, not only the last commit
+          persist-credentials: false
+
+      # The old secrets are still in the history, so this job fails until they are rotated and
+      # a baseline is agreed (see RISKS.md). TODO verify: pin to a full SHA, and check the licence
+      # terms for organisations. Alternative: run the gitleaks CLI directly, pinned by version.
+      - uses: gitleaks/gitleaks-action@<FULL_COMMIT_SHA_TODO_VERIFY>
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  image:
+    needs: [test, secret-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@<FULL_COMMIT_SHA_TODO_VERIFY>   # v4, TODO verify
+        with:
+          persist-credentials: false
+
+      # k8s/examples holds sample files that are never deployed, so it is skipped.
+      # TODO verify the action ref (full SHA) and input names against its README.
+      - name: Scan Dockerfile and Kubernetes manifests
+        uses: aquasecurity/trivy-action@<FULL_COMMIT_SHA_TODO_VERIFY>
+        with:
+          scan-type: config
+          scan-ref: .
+          skip-dirs: k8s/examples
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Build the image (no push yet)
+        run: docker build --pull -t "$IMAGE_REF" .
+
+      - name: Scan the image for known vulnerabilities
+        uses: aquasecurity/trivy-action@<FULL_COMMIT_SHA_TODO_VERIFY>
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Generate the SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@<FULL_COMMIT_SHA_TODO_VERIFY>
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - uses: actions/upload-artifact@<FULL_COMMIT_SHA_TODO_VERIFY> # v4, TODO verify
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      # Secrets are used only below, and only for a push to main.
+      - name: Log in to the registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: echo "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u ci-bot --password-stdin
+
+      - name: Push the image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker push "$IMAGE_REF"
+
+  deploy:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The real gate is in GitHub settings, not in this file: required reviewers on this environment,
+    # deploy from main only, and branch protection on main. KUBECONFIG must be an environment
+    # secret of "test-cluster", not a repository secret.
+    # TODO verify: environment protection on private repositories may need a paid plan.
+    environment: test-cluster
+    concurrency:
+      group: deploy-test-cluster
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@<FULL_COMMIT_SHA_TODO_VERIFY>   # v4, TODO verify
+        with:
+          persist-credentials: false
+
+      # Guard: the manifest must carry the placeholder replaced below, or we would deploy a stale image.
+      - name: Check that the manifest has the image placeholder
+        run: grep -q '__IMAGE_TAG__' k8s/deployment.yaml
+
+      - name: Write the kubeconfig
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+        run: |
+          umask 077
+          printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      # TODO verify: kubectl is on the runner image (or add a pinned install step).
+      - name: Check that the application secret exists (created outside the repository)
+        run: kubectl -n stockdesk get secret stockdesk-env
+
+      # The namespace is created once by a cluster admin, so the kubeconfig here can be a
+      # namespace-scoped ServiceAccount instead of cluster-admin. k8s/examples is never deployed.
+      - name: Apply the manifests
+        run: |
+          kubectl apply -f k8s/networkpolicy.yaml
+          sed "s|__IMAGE_TAG__|${GITHUB_SHA}|" k8s/deployment.yaml | kubectl apply -f -
+
+      - name: Wait for the rollout
+        id: rollout
+        run: kubectl -n stockdesk rollout status deployment/stockdesk --timeout=120s
+
+      - name: Roll back if the rollout failed
+        if: failure() && steps.rollout.outcome == 'failure'
+        run: kubectl -n stockdesk rollout undo deployment/stockdesk
